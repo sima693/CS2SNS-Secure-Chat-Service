@@ -1,0 +1,20 @@
+# Compiled output
+out/
+bin/
+*.class
+
+# Keystores / truststores - never commit private keys
+certs/*.jks
+certs/*.p12
+certs/*.keystore
+
+# Wireshark captures (screenshots go in docs/, raw captures stay local)
+*.pcap
+*.pcapng
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
