@@ -3,6 +3,7 @@ package server;
 import common.Args;
 import common.Protocol;
 import common.Transport;
+
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -19,7 +20,9 @@ import java.util.concurrent.Executors;
  * java -cp out server.ChatServer [--port 8888] [--secure]
  *
  * In TLS mode (--secure), sockets are created through the Transport
- * layer which provides encrypted communication using SSL/TLS.
+ * layer which provides encrypted communication using SSL/TLS. Level 3
+ * adds PBKDF2-backed credential authentication, account lockout/attempt
+ * throttling, and validated chat messaging over that transport.
  *
  * The main thread only accepts connections; each client is handed to a
  * ClientHandler running on a thread pool, so one slow or misbehaving
@@ -29,17 +32,20 @@ public class ChatServer {
 
     private static final DateTimeFormatter TIME =
             DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final String DEFAULT_USER_STORE = "users.db";
 
     private final int port;
     private final Transport.Mode mode;
     private final ClientRegistry registry = new ClientRegistry();
     private final ExecutorService pool = Executors.newCachedThreadPool();
+    private final AuthManager authManager;
 
     private volatile ServerSocket serverSocket;
 
-    public ChatServer(int port, Transport.Mode mode) {
+    public ChatServer(int port, Transport.Mode mode, AuthManager authManager) {
         this.port = port;
         this.mode = mode;
+        this.authManager = authManager;
     }
 
     public void start() throws IOException {
@@ -64,7 +70,7 @@ public class ChatServer {
                         + ":"
                         + socket.getPort());
 
-                pool.execute(new ClientHandler(socket, registry));
+                pool.execute(new ClientHandler(socket, registry, authManager));
 
             } catch (SocketException e) {
 
@@ -111,9 +117,13 @@ public class ChatServer {
                     "--port",
                     Protocol.DEFAULT_PORT);
 
+            Transport.Mode mode = Transport.modeFromArgs(args);
+            AuthManager authManager = new AuthManager(DEFAULT_USER_STORE);
+
             new ChatServer(
                     port,
-                    Transport.modeFromArgs(args))
+                    mode,
+                    authManager)
                     .start();
 
         } catch (IllegalArgumentException | UnsupportedOperationException e) {

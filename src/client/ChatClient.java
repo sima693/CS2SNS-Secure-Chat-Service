@@ -5,11 +5,13 @@ import common.Protocol;
 import common.Transport;
 
 import java.io.BufferedReader;
+import java.io.Console;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.net.Socket;
+import java.util.Arrays;
 
 /**
  * Text-based chat client.
@@ -114,19 +116,41 @@ public class ChatClient {
     }
 
     /**
-     * Runs the username handshake.
-     * Returns false if the connection closed first.
+     * Runs the authentication/registration handshake after the socket
+     * (and any TLS handshake) is established. Returns false if the connection
+     * closed before joining.
      */
     private boolean joinChat(
             BufferedReader keyboard,
             BufferedReader in,
             PrintWriter out) throws IOException {
 
+        Console console = System.console();
         String line;
 
         while ((line = in.readLine()) != null) {
 
-            if (line.equals(Protocol.USERNAME_PROMPT)) {
+            if (line.equals(Protocol.AUTH_MODE_PROMPT)) {
+
+                System.out.print("Login or register ([L]ogin / [R]egister): ");
+                System.out.flush();
+
+                String choice = keyboard.readLine();
+
+                if (choice == null) {
+                    return false;
+                }
+
+                String normalised = choice.strip().toUpperCase();
+                if (normalised.equals("R") || normalised.equals(Protocol.MODE_REGISTER)) {
+                    out.println(Protocol.MODE_REGISTER);
+                } else if (normalised.equals("L") || normalised.equals(Protocol.MODE_LOGIN)) {
+                    out.println(Protocol.MODE_LOGIN);
+                } else {
+                    out.println(choice.strip());
+                }
+
+            } else if (line.equals(Protocol.USERNAME_PROMPT)) {
 
                 System.out.print("Enter your username: ");
                 System.out.flush();
@@ -138,6 +162,34 @@ public class ChatClient {
                 }
 
                 out.println(name);
+
+            } else if (line.equals(Protocol.PASSWORD_PROMPT)) {
+
+                char[] passwordChars = null;
+                try {
+                    if (console != null) {
+                        passwordChars = console.readPassword("Enter your password: ");
+                    } else {
+                        // Fallback when running inside an IDE console where System.console() is null.
+                        System.out.print("Enter your password: ");
+                        System.out.flush();
+                        String typed = keyboard.readLine();
+                        if (typed == null) {
+                            return false;
+                        }
+                        passwordChars = typed.toCharArray();
+                    }
+
+                    if (passwordChars == null) {
+                        return false;
+                    }
+
+                    out.println(new String(passwordChars));
+                } finally {
+                    if (passwordChars != null) {
+                        Arrays.fill(passwordChars, '\0');
+                    }
+                }
 
             } else if (line.startsWith(
                     Protocol.ACCEPTED_PREFIX)) {
