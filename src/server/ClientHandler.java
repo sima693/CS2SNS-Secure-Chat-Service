@@ -12,28 +12,33 @@ import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 
 /**
- * Handles one connected client on its own thread.
+ * Handles one connected client on its own thread over the TLS-secured socket.
  *
- * Lifecycle: ask for a username until a valid, unused one is given, announce
- * the join, then relay every line the client sends to the whole group until
- * the client types /quit or the connection drops. However the connection
- * ends, the finally block removes the client and tells everyone else, so a
- * crashed or killed client can never take the server down with it.
+ * Lifecycle (Level 3):
+ *   1. Authenticate or register the user (LOGIN or REGISTER + username + password)
+ *      over the TLS stream using PBKDF2-hashed credentials in {@link AuthManager}.
+ *   2. Enforce failed-attempt limits and account lockouts before granting access;
+ *      unauthenticated clients are never added to {@link ClientRegistry}.
+ *   3. Relay validated chat messages and commands (/users, /help, /quit) until
+ *      the client leaves or disconnects, cleaning up in the finally block.
  */
 public class ClientHandler implements Runnable {
 
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final int MAX_FAILED_ATTEMPTS = 3;
 
     private final Socket socket;
     private final ClientRegistry registry;
+    private final AuthManager authManager;
     private final String remote;
 
     private PrintWriter out;
     private String username;
 
-    public ClientHandler(Socket socket, ClientRegistry registry) {
+    public ClientHandler(Socket socket, ClientRegistry registry, AuthManager authManager) {
         this.socket = socket;
         this.registry = registry;
+        this.authManager = authManager;
         this.remote = socket.getInetAddress().getHostAddress() + ":" + socket.getPort();
     }
 
@@ -45,7 +50,7 @@ public class ClientHandler implements Runnable {
 
             out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), Protocol.CHARSET), true);
 
-            joined = negotiateUsername(in);
+            joined = authenticateClient(in);
             if (!joined) {
                 return;
             }
@@ -74,27 +79,113 @@ public class ClientHandler implements Runnable {
         }
     }
 
-    /** Keeps asking until the client picks a valid, unused name. */
-    private boolean negotiateUsername(BufferedReader in) throws IOException {
-        while (true) {
-            send(Protocol.USERNAME_PROMPT);
-            String candidate = in.readLine();
-            if (candidate == null) {
-                return false; // disconnected before joining
-            }
-            candidate = candidate.strip();
+    /**
+     * Authenticates or registers a user before allowing access to the chat room.
+     * Enforces a per-session attempt cap and delegates password verification/lockout
+     * rules to {@link AuthManager}.
+     */
+    private boolean authenticateClient(BufferedReader in) throws IOException {
+        int failedAttempts = 0;
 
-            String problem = Protocol.validateUsername(candidate);
-            if (problem == null && !registry.register(candidate, this)) {
-                problem = "Username '" + candidate + "' is already taken.";
+        while (failedAttempts < MAX_FAILED_ATTEMPTS) {
+            send(Protocol.AUTH_MODE_PROMPT);
+            String rawMode = in.readLine();
+            if (rawMode == null) {
+                return false;
             }
-            if (problem == null) {
-                username = candidate;
+            String mode = Protocol.sanitiseLine(rawMode).toUpperCase();
+            if (!Protocol.MODE_LOGIN.equals(mode) && !Protocol.MODE_REGISTER.equals(mode)) {
+                failedAttempts++;
+                send(Protocol.REJECTED_PREFIX + "Invalid mode. Use "
+                        + Protocol.MODE_LOGIN + " or " + Protocol.MODE_REGISTER + ".");
+                continue;
+            }
+
+            send(Protocol.USERNAME_PROMPT);
+            String rawCandidate = in.readLine();
+            if (rawCandidate == null) {
+                return false;
+            }
+            String candidate = Protocol.sanitiseLine(rawCandidate);
+
+            String userProblem = Protocol.validateUsername(candidate);
+            if (userProblem != null) {
+                failedAttempts++;
+                send(Protocol.REJECTED_PREFIX + userProblem);
+                continue;
+            }
+
+            send(Protocol.PASSWORD_PROMPT);
+            String password = in.readLine();
+            if (password == null) {
+                return false;
+            }
+
+            // Strip line-ending control characters without altering intentional spaces/symbols
+            String cleanPassword = password.replaceAll("[\\r\\n]", "");
+
+            if (Protocol.MODE_REGISTER.equals(mode)) {
+                String passProblem = Protocol.validatePassword(cleanPassword);
+                if (passProblem != null) {
+                    failedAttempts++;
+                    send(Protocol.REJECTED_PREFIX + passProblem);
+                    continue;
+                }
+
+                try {
+                    if (!authManager.registerUser(candidate, cleanPassword)) {
+                        failedAttempts++;
+                        ChatServer.log("AUTH_FAIL REGISTER " + candidate + " from " + remote);
+                        send(Protocol.REJECTED_PREFIX + "Registration failed for '" + candidate + "'.");
+                        continue;
+                    }
+                } catch (IOException e) {
+                    ChatServer.log("AUTH_ERR storage failure for " + candidate + ": " + e.getMessage());
+                    send(Protocol.REJECTED_PREFIX + "Internal error saving credentials.");
+                    return false;
+                }
+
+                if (!registry.register(candidate, this)) {
+                    send(Protocol.REJECTED_PREFIX + "Account created, but user is already active.");
+                    return false;
+                }
+
+                this.username = candidate;
+                ChatServer.log("AUTH_OK REGISTER " + username + " from " + remote);
                 send(Protocol.ACCEPTED_PREFIX + username);
                 return true;
+            } else {
+                AuthManager.AuthResult result = authManager.authenticate(candidate, cleanPassword);
+                switch (result) {
+                    case SUCCESS -> {
+                        if (!registry.register(candidate, this)) {
+                            failedAttempts++;
+                            send(Protocol.REJECTED_PREFIX + "User '" + candidate + "' is already logged in.");
+                            continue;
+                        }
+                        this.username = candidate;
+                        ChatServer.log("AUTH_OK LOGIN " + username + " from " + remote);
+                        send(Protocol.ACCEPTED_PREFIX + username);
+                        return true;
+                    }
+                    case ACCOUNT_LOCKED -> {
+                        ChatServer.log("AUTH_LOCKED " + candidate + " from " + remote);
+                        send(Protocol.REJECTED_PREFIX + "Account temporarily locked. Try again later.");
+                        return false;
+                    }
+                    case INVALID_CREDENTIALS -> {
+                        failedAttempts++;
+                        ChatServer.log("AUTH_FAIL LOGIN " + candidate + " from " + remote
+                                + " (attempt " + failedAttempts + "/" + MAX_FAILED_ATTEMPTS + ")");
+                        send(Protocol.REJECTED_PREFIX + "Invalid username or password.");
+                    }
+                }
             }
-            send(Protocol.REJECTED_PREFIX + problem);
         }
+
+        ChatServer.log("AUTH_DENY max attempts reached from " + remote);
+        send(Protocol.REJECTED_PREFIX + "Too many failed authentication attempts. Disconnecting.");
+        return false;
     }
 
     /** Processes one line from the client. Returns false when the client wants to leave. */
